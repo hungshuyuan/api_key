@@ -185,7 +185,15 @@ function App() {
           {apiKey && (
             <div style={{ marginTop: '30px', padding: '20px', backgroundColor: '#f0f0f0', borderRadius: '8px' }}>
               <h3>✅ 申請成功！</h3>
-              <p>您的 Key: <strong>{apiKey}</strong></p>
+              <p style={{
+                wordBreak: 'break-all',     // 強制長字串在邊界換行
+                whiteSpace: 'normal',      // 允許正常換行
+                backgroundColor: '#eee',   // 灰底背景
+                padding: '10px',
+                borderRadius: '4px',
+                fontFamily: 'monospace',   // 使用等寬字型，看起來更專業
+                fontSize: '14px'
+              }}>您的 Key: <strong>{apiKey}</strong></p>
               
               <button
                 onClick={handleCopyKey}

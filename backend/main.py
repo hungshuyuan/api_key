@@ -31,7 +31,7 @@ app = FastAPI(title="NKUST API Key Service")
 # 設定 CORS (允許 Vite 預設 port 5173)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"], 
+    allow_origins=["http://localhost:5173","https://163.18.26.144.nip.io:5173"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
