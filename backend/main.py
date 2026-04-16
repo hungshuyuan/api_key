@@ -1,8 +1,7 @@
 import os
 import asyncio
-import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import Optional, List
 
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -13,25 +12,68 @@ from dotenv import load_dotenv
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
 import jwt
-import httpx  #發送 HTTP 請求API
+import httpx
 
-import qrcode
-import base64
-from io import BytesIO
+# --- 新增：資料庫與加密套件 ---
+from sqlalchemy import create_engine, Column, Integer, String
+from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from cryptography.fernet import Fernet
 
 # 載入環境變數
 load_dotenv()
 
+# --- 環境變數與驗證設定 ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
 JWT_SECRET = os.getenv("JWT_SECRET", "super-secret-key-for-dev")
 JWT_ALGORITHM = "HS256"
 
+# 學長的 LiteLLM API 設定 (請в .env 中設定，或修改預設值)
+LITELLM_API_BASE = os.getenv("LITELLM_API_BASE", "https://b225.54ucl.com/capystar/auth")
+LITELLM_MANAGE_KEY = os.getenv("LITELLM_MANAGE_KEY", "sk-your-manage-key")
+
+# 新用戶預設參數
+NEW_USER_MAX_BUDGET = float(os.getenv("NEW_USER_MAX_BUDGET", "100"))
+NEW_USER_ROLE = os.getenv("NEW_USER_ROLE", "internal_user")
+NEW_USER_BUDGET_DURATION = os.getenv("NEW_USER_BUDGET_DURATION", "7d")
+
+# 加密 Key (用來加密存進資料庫的 raw_key，防止資料外線。可用 Fernet.generate_key() 產生)
+ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+cipher_suite = Fernet(ENCRYPTION_KEY.encode())
+
+# --- 資料庫設定 (預設使用 SQLite：keys.db) ---
+SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./keys.db")
+engine = create_engine(
+    SQLALCHEMY_DATABASE_URL, 
+    connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {}
+)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+Base = declarative_base()
+
+# 定義資料表 Schema
+class ApiKeyRecord(Base):
+    __tablename__ = "api_keys"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, index=True)
+    key_alias = Column(String, index=True)  # 例如: C113118289_1744800000
+    encrypted_raw_key = Column(String)      # 加密後的完整 key（備用）
+
+# 自動建立資料表
+Base.metadata.create_all(bind=engine)
+
+def get_db():
+    db = SessionLocal()
+    try:
+        yield db
+    finally:
+        db.close()
+
+
 app = FastAPI(title="NKUST API Key Service")
 
-# 設定 CORS (允許 Vite 預設 port 5173)
+# 設定 CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173","https://163.18.26.144.nip.io:5173"], 
+    allow_origins=["*"], 
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -39,7 +81,7 @@ app.add_middleware(
 
 security = HTTPBearer()
 
-# --- 依賴注入 (Dependency)：驗證我們自己核發的 JWT ---
+# --- 依賴注入：驗證自己的 JWT ---
 def verify_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
@@ -57,38 +99,64 @@ class AuthResponse(BaseModel):
     access_token: str
     student_id: str
 
-# --- API Endpoints ---
+class KeyResponse(BaseModel):
+    id: int
+    key_name: str            # LiteLLM 回傳的遮罩 key，例如 sk-...FJUQ
+    key_alias: str           # 例如 C113118289_1744800000
+    spend: float             # 此 key 的用量
+    user_total_spend: float  # 帳號總用量（user 層）
+    max_budget: float        # 帳號預算上限（user 層）
+    budget_duration: str     # 重置週期，例如 '7d'
+    budget_reset_at: Optional[str]  # 下次重置時間，ISO 格式
 
+# --- 共用函式：取得學長 API 用的 Header ---
+def get_litellm_headers():
+    return {
+        "Authorization": f"Bearer {LITELLM_MANAGE_KEY}",
+        "Content-Type": "application/json"
+    }
+
+# ==========================================
+# 1. 登入邏輯 (含學長端 /user/info 與 /user/new)
+# ==========================================
 @app.post("/api/auth/google", response_model=AuthResponse)
 async def google_auth(request: GoogleAuthRequest):
     try:
-        # 1. 驗證 Google Token
-        # Google 官方提供的驗證函式
         id_info = id_token.verify_oauth2_token(
-            # request.token：ID Token；google_requests.Request()：Google Auth 套件用來發送 HTTP 請求的工具
-            # GOOGLE_CLIENT_ID：.env內的字串；clock_skew_in_seconds=10：容錯 10秒誤差
-            request.token, google_requests.Request(), GOOGLE_CLIENT_ID,clock_skew_in_seconds=10
+            request.token, google_requests.Request(), GOOGLE_CLIENT_ID, clock_skew_in_seconds=10
         )
-        
         email = id_info.get("email", "")
         
-        # 2. 驗證是否為高科大信箱 (可依需求擴充其他網域)
         allowed_domains = ["nkust.edu.tw"]
         domain = email.split("@")[-1]
-        
         if domain not in allowed_domains:
             raise HTTPException(status_code=403, detail="權限不足：限高科大 (NKUST) 學生帳號登入")
             
-        # 3. 擷取學號 (切割 @ 前面的字串)
-        # upper() 小寫轉大寫
         student_id = email.split("@")[0].upper()
-        
-        # 4. 簽發我們自己的 JWT 給前端使用
-        # 自己做一張名牌（JWT）交給前端，讓前端以後拿著這張名牌來要資料，而不需要每次都重新登入 Google
-        # 有效期限
+
+        # [新增] 檢查並註冊 LiteLLM 使用者
+        async with httpx.AsyncClient() as client:
+            headers = get_litellm_headers()
+            
+            # 檢查使用者是否登入過 (有此用戶)
+            check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={student_id}", headers=headers)
+            
+            if check_res.status_code == 404:
+                # 若無該用戶，向學長 API 新增用戶
+                new_user_payload = {
+                    "user_id": student_id,
+                    "max_budget": NEW_USER_MAX_BUDGET,
+                    "user_role": NEW_USER_ROLE,
+                    "budget_duration": NEW_USER_BUDGET_DURATION,
+                }
+                create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=new_user_payload, headers=headers)
+                if create_res.status_code != 200:
+                    raise HTTPException(status_code=500, detail="無法在 LiteLLM 系統建立新用戶")
+            elif check_res.status_code != 200:
+                raise HTTPException(status_code=500, detail="LiteLLM 系統連線發生錯誤")
+
+        # 簽發 JWT 給前端
         expire = datetime.utcnow() + timedelta(hours=2)
-        # student_id：記錄這個 Token 是屬於哪個學號的。
-        # exp (Expiration Time)：這是 JWT 的標準保留字，Token有效期限
         jwt_payload = {"student_id": student_id, "exp": expire}
         access_token = jwt.encode(jwt_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
         
@@ -99,112 +167,140 @@ async def google_auth(request: GoogleAuthRequest):
         raise HTTPException(status_code=401, detail="無效的 Google Token")
 
 
-
-@app.post("/api/apply-key")
-async def apply_key(student_id: str = Depends(verify_jwt)):
-    # 學長的 API 網址
-    external_api_url = "https://b225.54ucl.com/capystar/auth/generate-key"
-    
-    # 準備要傳給學長 API 的資料 (JSON 格式)
+# ==========================================
+# 2. 申請 Key (存入本地 DB)
+# ==========================================
+@app.post("/api/keys/generate")
+async def generate_key(student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
+    timestamp = int(datetime.utcnow().timestamp())
     payload = {
-        "student_id": student_id
+        "user_id": student_id,
+        "key_alias": f"{student_id}_{timestamp}",
+        "key_type": "llm_api" # 依學長規格
     }
     
-    # 使用 httpx 發送非同步請求
     async with httpx.AsyncClient() as client:
         try:
             response = await client.post(
-                external_api_url,
+                f"{LITELLM_API_BASE}/key/generate",
                 json=payload,
-                headers={"Content-Type": "application/json"}
+                headers=get_litellm_headers()
             )
-            
-            # 檢查學長的 API 是否回傳成功 (狀態碼 200 系列)
             response.raise_for_status()
-            
-            # 取得學長 API 回傳的 JSON 資料
             data = response.json()
             
-            # 直接將學長給的資料回傳給前端
-            return data
+            raw_key = data.get("key")
+            if not raw_key:
+                raise HTTPException(status_code=500, detail="學長 API 未回傳有效的 Key")
+
+            # 使用 Fernet 將完整 Key 加密後再存入 DB，保護明文安全
+            encrypted_key = cipher_suite.encrypt(raw_key.encode()).decode()
+            key_alias = f"{student_id}_{timestamp}"
+
+            # 存入資料庫
+            new_key_record = ApiKeyRecord(
+                student_id=student_id,
+                key_alias=key_alias,
+                encrypted_raw_key=encrypted_key
+            )
+            db.add(new_key_record)
+            db.commit()
+            db.refresh(new_key_record)
+            
+            # 僅在申請當下回傳一次完整 raw_key，之後不再顯示
+            return {"message": "申請成功", "key": raw_key}
             
         except httpx.HTTPStatusError as e:
-            # 處理學長 API 回傳錯誤的情況 (例如 400 或 500 錯誤)
             print(f"🚨 學長 API 錯誤: {e.response.text}")
-            raise HTTPException(status_code=e.response.status_code, detail="無法向系統申請金鑰，請稍後再試")
-            
-        except httpx.RequestError as e:
-            # 處理連線失敗 (例如網路斷線、伺服器死機) 的情況
-            print(f"🚨 連線錯誤: {e}")
-            raise HTTPException(status_code=500, detail="與金鑰伺服器連線失敗")
+            raise HTTPException(status_code=e.response.status_code, detail="申請金鑰失敗")
 
 
+# ==========================================
+# 3. 取得使用者的 Key 列表與目前用量
+# ==========================================
+@app.get("/api/keys", response_model=List[KeyResponse])
+async def get_my_keys(student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
+    # 向學長 API 查詢該 user 的所有 key 與用量（一次搞定）
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{LITELLM_API_BASE}/user/info?user_id={student_id}",
+            headers=get_litellm_headers()
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail="無法取得用量資訊")
+        data = res.json()
 
-# -----掃碼登入-----
+    user_info = data.get("user_info", {})
+    litellm_keys = data.get("keys", [])
+    max_budget = user_info.get("max_budget", 0.0) or 0.0
+    user_total_spend = user_info.get("spend", 0.0) or 0.0
+    budget_duration = user_info.get("budget_duration") or "N/A"
+    budget_reset_at = user_info.get("budget_reset_at")
+
+    # 建立 key_alias → db_id 的對應表（用於讓前端拿到刪除所需的 id）
+    db_records = db.query(ApiKeyRecord).filter(ApiKeyRecord.student_id == student_id).all()
+    alias_to_id = {r.key_alias: r.id for r in db_records}
+
+    result = []
+    for k in litellm_keys:
+        alias = k.get("key_alias", "")
+        db_id = alias_to_id.get(alias)
+        if db_id is None:
+            continue  # 不在自己 DB 的 key（非本系統申請），略過
+        result.append({
+            "id": db_id,
+            "key_name": k.get("key_name", ""),
+            "key_alias": alias,
+            "spend": k.get("spend", 0.0) or 0.0,
+            "user_total_spend": user_total_spend,
+            "max_budget": max_budget,
+            "budget_duration": budget_duration,
+            "budget_reset_at": budget_reset_at,
+        })
+
+    return result
 
 
-# 模擬外部 DB 的操作 (你需要替換成實際呼叫外部 DB API 的 httpx 程式碼)
-async def save_session_to_external_db(session_id: str):
-    # TODO: 用 httpx.post 打外部 DB，告訴它建立一筆 session_id，狀態為 PENDING
-    pass
+# ==========================================
+# 4. 註銷/刪除 Key
+# ==========================================
+@app.delete("/api/keys/{key_id}")
+async def delete_key(key_id: int, student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
+    # 1. 驗證身分 (確保該 Key 屬於發出請求的學號)
+    record = db.query(ApiKeyRecord).filter(ApiKeyRecord.id == key_id, ApiKeyRecord.student_id == student_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="找不到此 API Key 或無權限")
 
-async def check_session_in_external_db(session_id: str):
-    # TODO: 用 httpx.get 打外部 DB，查詢這個 session_id 的最新狀態
-    # 假設外部 DB 回傳: {"status": "SUCCESS", "student_id": "C110...123"}
-    # 這邊先 mock 一下：
-    return {"status": "PENDING"} # 測試時可以手動改成 SUCCESS 來測
+    async with httpx.AsyncClient() as client:
+        try:
+            # 2. 向學長 API 發出刪除請求（用 key_alias，不需解密）
+            await client.post(
+                f"{LITELLM_API_BASE}/key/delete",
+                json={"key_aliases": [record.key_alias]},
+                headers=get_litellm_headers()
+            )
 
-@app.get("/api/auth/qr/generate")
-async def generate_qr_code():
-    """產生一組新的 QR Code 登入 Session"""
-    # 1. 產生唯一的 Session ID (Key)
-    session_id = uuid.uuid4().hex
-    
-    # 2. 將 Session ID 註冊到外部 DB (等待被掃描)
-    await save_session_to_external_db(session_id)
-    
-    # 3. 製作 QR Code (將字串包裝成 JSON 或是特定格式供 APP 辨識)
-    qr_data = f"nkust-login:{session_id}"
-    qr = qrcode.QRCode(version=1, box_size=10, border=4)
-    qr.add_data(qr_data)
-    qr.make(fit=True)
-    
-    # 將 QR Code 轉成 Base64 圖片，讓前端直接當作圖片 src 顯示
-    img = qr.make_image(fill_color="black", back_color="white")
-    buffered = BytesIO()
-    img.save(buffered, format="PNG")
-    img_base64 = base64.b64encode(buffered.getvalue()).decode("utf-8")
-    
-    return {
-        "session_id": session_id,
-        "qr_image": f"data:image/png;base64,{img_base64}"
-    }
+            # 3. 從本地資料庫刪除紀錄
+            db.delete(record)
+            db.commit()
 
-@app.get("/api/auth/qr/status/{session_id}")
-async def check_qr_status(session_id: str):
-    """前端用來輪詢 (Polling) 檢查是否登入成功的 API"""
-    # 1. 向外部 DB 查詢狀態
-    db_record = await check_session_in_external_db(session_id)
-    
-    if db_record["status"] == "SUCCESS":
-        student_id = db_record.get("student_id")
-        
-        # 2. 狀態為成功，核發我們自己的 JWT 給前端 (重用你之前的邏輯)
-        expire = datetime.utcnow() + timedelta(hours=2)
-        jwt_payload = {"student_id": student_id, "exp": expire}
-        access_token = jwt.encode(jwt_payload, JWT_SECRET, algorithm=JWT_ALGORITHM)
-        
-        return {
-            "status": "SUCCESS",
-            "access_token": access_token,
-            "student_id": student_id
-        }
-    elif db_record["status"] == "EXPIRED":
-        # 如果你想做超時機制
-        raise HTTPException(status_code=400, detail="QR Code 已過期，請重新整理")
-    
-    # 還沒掃描或還在處理中
-    return {"status": "PENDING"}
+            return {"message": "註銷成功"}
+
+        except httpx.HTTPError as e:
+            print(f"註銷 Key 失敗: {e}")
+            raise HTTPException(status_code=500, detail="註銷失敗，請稍後再試")
+
+
+# ==========================================
+# 5. 查看完整 Raw Key
+# ==========================================
+@app.get("/api/keys/{key_id}/reveal")
+async def reveal_key(key_id: int, student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
+    record = db.query(ApiKeyRecord).filter(ApiKeyRecord.id == key_id, ApiKeyRecord.student_id == student_id).first()
+    if not record:
+        raise HTTPException(status_code=404, detail="找不到此 API Key 或無權限")
+    raw_key = cipher_suite.decrypt(record.encrypted_raw_key.encode()).decode()
+    return {"raw_key": raw_key}
 
 
 if __name__ == "__main__":
