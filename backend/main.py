@@ -32,9 +32,9 @@ LITELLM_API_BASE = os.getenv("LITELLM_API_BASE", "https://b225.54ucl.com/capysta
 LITELLM_MANAGE_KEY = os.getenv("LITELLM_MANAGE_KEY", "sk-your-manage-key")
 
 # 新用戶預設參數
-NEW_USER_MAX_BUDGET = float(os.getenv("NEW_USER_MAX_BUDGET", "100"))
+# NEW_USER_MAX_BUDGET = float(os.getenv("NEW_USER_MAX_BUDGET", "100"))
 NEW_USER_ROLE = os.getenv("NEW_USER_ROLE", "internal_user")
-NEW_USER_BUDGET_DURATION = os.getenv("NEW_USER_BUDGET_DURATION", "7d")
+# NEW_USER_BUDGET_DURATION = os.getenv("NEW_USER_BUDGET_DURATION", "7d")
 
 # 加密 Key (用來加密存進資料庫的 raw_key，防止資料外線。可用 Fernet.generate_key() 產生)
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
@@ -46,6 +46,8 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL, 
     connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {}
 )
+# 正式上線後要刪除有關邏輯
+TEST = os.getenv("TEST", "false").lower() == "true"
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -119,6 +121,32 @@ def get_litellm_headers():
 # ==========================================
 # 1. 登入邏輯 (含學長端 /user/info 與 /user/new)
 # ==========================================
+def role_payload(student_id: str):
+    first = student_id[0].upper()
+    if first == "C":
+        max_budget = float(os.getenv("C_MAX_BUDGET", -1))
+        budget_duration = os.getenv("C_BUDGET_DURATION", -1)
+    elif first == "F":
+        max_budget = float(os.getenv("F_MAX_BUDGET", -1))
+        budget_duration = os.getenv("F_BUDGET_DURATION", -1)
+    elif first.isdigit():
+        # 若學號第一個字為數字，使用數字類型預設設定（可在 .env 中設定 NUM_MAX_BUDGET / NUM_BUDGET_DURATION）
+        max_budget = float(os.getenv("NUM_MAX_BUDGET", -1))
+        budget_duration = os.getenv("NUM_BUDGET_DURATION", -1)
+
+    # 正式上線後要刪除有關邏輯
+    if TEST:
+        return {
+            "user_id": student_id,
+            "user_role": NEW_USER_ROLE,
+            "budget_duration": budget_duration,
+        }
+    return {
+        "user_id": student_id,
+        "max_budget": max_budget,
+        "user_role": NEW_USER_ROLE,
+        "budget_duration": budget_duration,
+    }
 @app.post("/api/auth/google", response_model=AuthResponse)
 async def google_auth(request: GoogleAuthRequest):
     try:
@@ -143,13 +171,8 @@ async def google_auth(request: GoogleAuthRequest):
             
             if check_res.status_code == 404:
                 # 若無該用戶，向學長 API 新增用戶
-                new_user_payload = {
-                    "user_id": student_id,
-                    "max_budget": NEW_USER_MAX_BUDGET,
-                    "user_role": NEW_USER_ROLE,
-                    "budget_duration": NEW_USER_BUDGET_DURATION,
-                }
-                create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=new_user_payload, headers=headers)
+                role_payload_data = role_payload(student_id)
+                create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=role_payload_data, headers=headers)
                 if create_res.status_code != 200:
                     raise HTTPException(status_code=500, detail="無法在 LiteLLM 系統建立新用戶")
             elif check_res.status_code != 200:
