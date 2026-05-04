@@ -1,6 +1,7 @@
 import { useState, useEffect } from 'react';
 import { GoogleLogin, type CredentialResponse } from '@react-oauth/google';
 import axios from 'axios';
+import { Dropdown, type DropdownOption } from './Dropdown';
 
 const API_BASE_URL = import.meta.env.VITE_API_BASE_URL;
 
@@ -16,17 +17,31 @@ interface KeyInfo {
   budget_reset_at: string | null;
 }
 
+interface CourseInfo {
+  id: number;
+  name: string;
+  std_api_key: string;
+  spend: number;
+  max_budget: number;
+  budget_duration: string;
+  budget_reset_at: string | null;
+}
+
 function App() {
   // --- 基礎狀態 ---
   const [token, setToken] = useState<string | null>(null);
   const [studentId, setStudentId] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
-  
+
   // --- API Key 管理相關狀態 ---
   const [keys, setKeys] = useState<KeyInfo[]>([]);
   const [loading, setLoading] = useState<boolean>(false);
   const [newlyCreatedKey, setNewlyCreatedKey] = useState<string | null>(null);
   const [revealedKey, setRevealedKey] = useState<string | null>(null);
+  const [course, setCourse] = useState<CourseInfo[]>([]);
+
+  // --- Dropdown 示例狀態 ---
+  const [selectedFilter, setSelectedFilter] = useState<DropdownOption | null>(null);
 
   // ==========================================
   // 0. 頁面載入時從 localStorage 還原登入狀態
@@ -56,24 +71,41 @@ function App() {
   // ==========================================
   // 1. 取得使用者的 API Keys 列表與用量
   // ==========================================
-  const fetchKeys = async (currentToken: string) => {
+  const fetchKeys = async (currentToken: string, isCourse: boolean) => {
     try {
       // 呼叫自己的後端。後端負責去 DB 撈出這個學號所有的 Key，
       // 並逐一向學長端 GET /key/info 取得 current_spend 與 max_budget 後合併回傳。
-      const res = await axios.get(`${API_BASE_URL}/api/keys`, {
-        headers: { Authorization: `Bearer ${currentToken}` }
-      });
-      setKeys(res.data);
+      if (isCourse) {
+
+      } else {
+        const res = await axios.get(`${API_BASE_URL}/api/keys`, {
+          headers: { Authorization: `Bearer ${currentToken}` }
+        });
+        setKeys(res.data)
+      }
     } catch (error) {
       console.error("載入 Key 列表失敗", error);
       setErrorMsg("無法載入您的 API Key 列表與用量");
     }
   };
 
+  const fetchCourse = async (currentToken: string) => {
+    try {
+      const res = await axios.get(`${API_BASE_URL}/api/course`, {
+        headers: { Authorization: `Bearer ${currentToken}` }
+      });
+      setCourse(res.data);
+    } catch (error) {
+      console.error("載入課程列表失敗", error);
+      setErrorMsg("無法載入課程列表");
+    }
+  };
+
   // 當成功取得 token (登入成功) 時，自動獲取 Key 列表
   useEffect(() => {
     if (token) {
-      fetchKeys(token);
+      fetchKeys(token, false);
+      fetchCourse(token);
     }
   }, [token]);
 
@@ -89,7 +121,7 @@ function App() {
       // 3. 若 404，則 POST /user/new 建立用戶。
       // 4. 最後回傳 JWT (access_token) 給前端。
       const res = await axios.post(`${API_BASE_URL}/api/auth/google`, {
-        token: credentialResponse.credential, 
+        token: credentialResponse.credential,
       });
       setToken(res.data.access_token);
       setStudentId(res.data.student_id);
@@ -114,13 +146,13 @@ function App() {
     try {
       // 呼叫後端 API，由後端向學長端 /key/generate 申請，並寫入自身 DB
       const res = await axios.post(
-        `${API_BASE_URL}/api/keys/generate`, 
+        `${API_BASE_URL}/api/keys/generate`,
         {},
         { headers: { Authorization: `Bearer ${token}` } }
       );
       const rawKey = res.data.key;
       setNewlyCreatedKey(rawKey);
-      fetchKeys(token); // 申請成功後，重新載入列表與最新用量
+      fetchKeys(token, false); // 申請成功後，重新載入列表與最新用量
     } catch (error) {
       setErrorMsg("申請 API Key 失敗，請確認登入狀態或稍後再試。");
     } finally {
@@ -162,7 +194,7 @@ function App() {
         headers: { Authorization: `Bearer ${token}` }
       });
       setDeleteTarget(null);
-      fetchKeys(token);
+      fetchKeys(token, false);
     } catch (error) {
       setErrorMsg('註銷 API Key 失敗，請稍後再試。');
     } finally {
@@ -211,7 +243,7 @@ function App() {
                 {newlyCreatedKey}
               </span>
               <button
-                onClick={() => navigator.clipboard.writeText(newlyCreatedKey)}
+                onClick={() => handleCopyKey(newlyCreatedKey)}
                 title="複製"
                 style={{ position: 'absolute', top: '50%', right: '12px', transform: 'translateY(-50%)', background: 'none', border: 'none', cursor: 'pointer', fontSize: '16px', color: '#666', padding: '4px' }}
               >
@@ -250,7 +282,7 @@ function App() {
             </div>
             <div style={{ display: 'flex', gap: '10px' }}>
               <button
-                onClick={() => navigator.clipboard.writeText(revealedKey)}
+                onClick={() => handleCopyKey(revealedKey)}
                 style={{ flex: 1, padding: '11px', backgroundColor: '#f0f0f0', color: '#333', border: 'none', borderRadius: '8px', cursor: 'pointer', fontSize: '14px', fontWeight: 600 }}
               >
                 📋 複製
@@ -314,7 +346,7 @@ function App() {
           </div>
         </div>
       )}
-      
+
       {errorMsg && (
         <div style={{ color: 'red', marginBottom: '20px', padding: '10px', border: '1px solid red', borderRadius: '4px' }}>
           {errorMsg}
@@ -385,7 +417,7 @@ function App() {
               <div style={{ marginTop: '4px', fontSize: '12px', color: '#aaa' }}>
                 每 {keys[0].budget_duration} 重置
                 {keys[0].budget_reset_at && (
-                  <span> · 下次重置：{new Date(keys[0].budget_reset_at).toLocaleDateString('zh-TW', { month: 'numeric', day: 'numeric' })}</span>
+                  <span> · 下次重置：{new Date(keys[0].budget_reset_at).toLocaleDateString('zh-TW', { year: 'numeric', month: 'numeric', day: 'numeric' })}</span>
                 )}
               </div>
               {/* 進度條 */}
@@ -401,8 +433,50 @@ function App() {
           )}
 
           {/* Key 列表 */}
-          <div style={{ fontSize: '13px', color: '#888', marginBottom: '10px', fontWeight: 500 }}>
-            API Keys（{keys.length}）
+          <div style={{ fontSize: '13px', color: '#888', marginBottom: '10px', fontWeight: 500, display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: '10px' }}>
+            <div>API Keys（{keys.length}）</div>
+            {/* 刷新按鈕 + Dropdown */}
+            <div style={{ display: 'flex', gap: '16px', alignItems: 'center' }}>
+              <button
+                onClick={() => fetchKeys(token || '', false)}
+                title="刷新 API Keys 列表"
+                style={{
+                  padding: '6px 8px',
+                  fontSize: '14px',
+                  cursor: 'pointer',
+                  backgroundColor: 'transparent',
+                  color: '#555',
+                  border: 'none',
+                  borderRadius: '4px',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  gap: '4px',
+                  flexShrink: 0,
+                  lineHeight: 1,
+                  transition: 'color 0.2s ease'
+                }}
+                onMouseEnter={(e) => (e.currentTarget.style.color = '#111')}
+                onMouseLeave={(e) => (e.currentTarget.style.color = '#555')}
+              >
+                <i className="fa-solid fa-arrows-rotate"></i>
+                刷新
+              </button>
+              <div style={{ minWidth: '200px' }}>
+                <Dropdown
+                  options={[
+                    { id: 'private', label: '私人 API Keys' },
+                    // { id: '2', label: '物聯網' },
+                    // { id: '3', label: '物件導向程式設計' },
+                    // { id: '4', label: '資料庫管理' },
+                    ...(course ? course.map((c) => ({ id: c.id.toString(), label: c.name.toString() })) : [])
+                  ]}
+                  onSelect={(option) => setSelectedFilter(option)}
+                  placeholder="篩選..."
+                  defaultLabel="None"
+                />
+              </div>
+            </div>
           </div>
 
           {keys.length === 0 ? (

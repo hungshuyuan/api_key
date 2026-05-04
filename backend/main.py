@@ -130,9 +130,8 @@ def role_payload(student_id: str):
         max_budget = float(os.getenv("F_MAX_BUDGET", -1))
         budget_duration = os.getenv("F_BUDGET_DURATION", -1)
     elif first.isdigit():
-        # 若學號第一個字為數字，使用數字類型預設設定（可在 .env 中設定 NUM_MAX_BUDGET / NUM_BUDGET_DURATION）
-        max_budget = float(os.getenv("NUM_MAX_BUDGET", -1))
-        budget_duration = os.getenv("NUM_BUDGET_DURATION", -1)
+        max_budget = float(os.getenv("T_MAX_BUDGET", -1))
+        budget_duration = os.getenv("T_BUDGET_DURATION", -1)
 
     # 正式上線後要刪除有關邏輯
     if TEST:
@@ -147,6 +146,7 @@ def role_payload(student_id: str):
         "user_role": NEW_USER_ROLE,
         "budget_duration": budget_duration,
     }
+
 @app.post("/api/auth/google", response_model=AuthResponse)
 async def google_auth(request: GoogleAuthRequest):
     try:

@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+sqlalchemy
+cryptography
+python-dotenv
+pyjwt
+httpx
+google-auth
+pydantic
+requests
