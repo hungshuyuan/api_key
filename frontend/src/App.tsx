@@ -131,7 +131,7 @@ function App() {
       if (error.response?.status === 403) {
         setErrorMsg("登入失敗：請使用高科大 (@nkust.edu.tw) 學生信箱！");
       } else {
-        setErrorMsg("登入過程中發生錯誤，請稍後再試。");
+        setErrorMsg("登入過程中發生錯誤，請稍後再試。" + (error.response?.data?.detail || ''));
       }
     }
   };
