@@ -1,9 +1,11 @@
 import os
 import asyncio
+import json
 from datetime import datetime, timedelta
 from typing import Optional, List
+import xml.etree.ElementTree as ET
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -117,6 +119,49 @@ def get_litellm_headers():
         "Authorization": f"Bearer {LITELLM_MANAGE_KEY}",
         "Content-Type": "application/json"
     }
+
+
+def _xml_element_to_value(element: ET.Element):
+    children = list(element)
+    if not children:
+        text = (element.text or "").strip()
+        return text
+
+    result = {}
+    for child in children:
+        child_value = _xml_element_to_value(child)
+        if child.tag in result:
+            if not isinstance(result[child.tag], list):
+                result[child.tag] = [result[child.tag]]
+            result[child.tag].append(child_value)
+        else:
+            result[child.tag] = child_value
+    return result
+
+
+async def parse_post_payload(request: Request):
+    content_type = (request.headers.get("content-type") or "").lower()
+    raw_body = await request.body()
+    text_body = raw_body.decode("utf-8", errors="replace").strip()
+
+    if not text_body:
+        return "empty", None
+
+    if "json" in content_type:
+        return "json", json.loads(text_body)
+
+    if "xml" in content_type:
+        root = ET.fromstring(text_body)
+        return "xml", {root.tag: _xml_element_to_value(root)}
+
+    try:
+        return "json", json.loads(text_body)
+    except json.JSONDecodeError:
+        try:
+            root = ET.fromstring(text_body)
+            return "xml", {root.tag: _xml_element_to_value(root)}
+        except ET.ParseError:
+            return "text", text_body
 
 # ==========================================
 # 1. 登入邏輯 (含學長端 /user/info 與 /user/new)
@@ -325,7 +370,15 @@ async def reveal_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
     raw_key = cipher_suite.decrypt(record.encrypted_raw_key.encode()).decode()
     return {"raw_key": raw_key}
 
-
+@app.post("/api/course/new")
+async def create_course(request: Request, student_id: str = Depends(verify_jwt)):
+    payload_format, payload = await parse_post_payload(request)
+    return {
+        "student_id": student_id,
+        "format": payload_format,
+        "data": payload,
+    }
+ 
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
