@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 import xml.etree.ElementTree as ET
 
-from fastapi import FastAPI, HTTPException, Depends, Request
+from fastapi import FastAPI, HTTPException, Depends, Request, UploadFile, File, Form, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
@@ -21,8 +21,14 @@ from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from cryptography.fernet import Fernet
 
+from db import get_db
+from models import Course, Student, CourseStudent
+import logging
+
 # 載入環境變數
 load_dotenv()
+router = APIRouter()
+logger = logging.getLogger("__uvicorn__")
 
 # --- 環境變數與驗證設定 ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -89,6 +95,7 @@ security = HTTPBearer()
 def verify_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         payload = jwt.decode(credentials.credentials, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        logger.info(f"JWT 驗證成功，payload: {payload}")
         return payload["student_id"]
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Token 已過期，請重新登入")
@@ -199,7 +206,7 @@ async def google_auth(request: GoogleAuthRequest):
             request.token, google_requests.Request(), GOOGLE_CLIENT_ID, clock_skew_in_seconds=10
         )
         email = id_info.get("email", "")
-        
+        logger.info(f"Google Auth - Email: {email}")
         allowed_domains = ["nkust.edu.tw"]
         domain = email.split("@")[-1]
         if domain not in allowed_domains:
@@ -231,7 +238,7 @@ async def google_auth(request: GoogleAuthRequest):
         return {"access_token": access_token, "student_id": student_id}
         
     except ValueError as e:
-        print(f"🚨 Token 驗證失敗的真正原因: {e}")
+        logger.error(f"🚨 Token 驗證失敗的真正原因: {e}")
         raise HTTPException(status_code=401, detail="無效的 Google Token")
 
 
@@ -241,6 +248,7 @@ async def google_auth(request: GoogleAuthRequest):
 @app.post("/api/keys/generate")
 async def generate_key(student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
     timestamp = int(datetime.utcnow().timestamp())
+    logger.info(f"申請 Key 的 student_id: {student_id}, timestamp: {timestamp}")
     payload = {
         "user_id": student_id,
         "key_alias": f"{student_id}_{timestamp}",
@@ -279,7 +287,7 @@ async def generate_key(student_id: str = Depends(verify_jwt), db: Session = Depe
             return {"message": "申請成功", "key": raw_key}
             
         except httpx.HTTPStatusError as e:
-            print(f"🚨 學長 API 錯誤: {e.response.text}")
+            logger.error(f"🚨 學長 API 錯誤: {e.response.text}")
             raise HTTPException(status_code=e.response.status_code, detail="申請金鑰失敗")
 
 
@@ -355,7 +363,7 @@ async def delete_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
             return {"message": "註銷成功"}
 
         except httpx.HTTPError as e:
-            print(f"註銷 Key 失敗: {e}")
+            logger.error(f"註銷 Key 失敗: {e}")
             raise HTTPException(status_code=500, detail="註銷失敗，請稍後再試")
 
 
@@ -371,14 +379,84 @@ async def reveal_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
     return {"raw_key": raw_key}
 
 @app.post("/api/course/new")
-async def create_course(request: Request, student_id: str = Depends(verify_jwt)):
-    payload_format, payload = await parse_post_payload(request)
-    return {
-        "student_id": student_id,
-        "format": payload_format,
-        "data": payload,
-    }
- 
+async def create_course(
+    courseID: str = Form(...),
+    courseName: str = Form(...),
+    students: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    try:
+        # ✅ 檢查 course 是否存在
+        existing = db.query(Course).filter_by(courseID=courseID).first()
+        if existing:
+            raise HTTPException(status_code=400, detail="Course already exists")
+
+        # ✅ 建立 course
+        new_course = Course(
+            courseID=courseID,
+            courseName=courseName,
+            created_at=datetime.utcnow()
+        )
+        db.add(new_course)
+
+        # ✅ 讀 XML
+        content = await students.read()
+
+        try:
+            root = ET.fromstring(content)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid XML format")
+
+        student_data = []
+
+        for item in root.findall(".//items/item"):
+            if item.attrib.get("type") == "title":
+                continue
+
+            sid = item.findtext("account")
+            name = item.findtext("realname")
+
+            if sid:
+                student_data.append({
+                    "studentID": sid,
+                    "studentName": name
+                })
+
+        # ✅ 寫入 DB
+        for s in student_data:
+            sid = s["studentID"]
+            name = s["studentName"]
+
+            # student
+            student = db.query(Student).filter_by(studentID=sid).first()
+            if not student:
+                student = Student(
+                    studentID=sid,
+                    studentName=name
+                )
+                db.add(student)
+
+            # relation（避免重複）
+            exists = db.query(CourseStudent).filter_by(
+                courseID=courseID,
+                studentID=sid
+            ).first()
+
+            if not exists:
+                db.add(CourseStudent(courseID=courseID, studentID=sid))
+
+        db.commit()
+
+        return {
+            "message": "Course created",
+            "courseID": courseID,
+            "students_count": len(student_data)
+        }
+
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=str(e))
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)

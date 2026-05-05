@@ -6,9 +6,5 @@ python-dotenv
 pyjwt
 httpx
 google-auth
-<<<<<<< HEAD
 pydantic
 requests
-=======
-pydantic
->>>>>>> a91b1fa027e67518599082098d617f807b7fb724

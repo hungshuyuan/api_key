@@ -338,7 +338,7 @@ function App() {
               <button
                 onClick={confirmDeleteKey}
                 disabled={deleteInput !== studentId || deleteLoading}
-                style={{ flex: 1, padding: '11px', backgroundColor: deleteInput === studentId ? '#e53935' : '#f5c6c6', color: '#fff', border: 'none', borderRadius: '8px', cursor: deleteInput === studentId ? 'pointer' : 'not-allowed', fontSize: '14px', fontWeight: 600, transition: 'background-color 0.2s' }}
+                style={{ flex: 1, padding: '11px', backgroundColor: deleteLoading ? '#9e9e9e' : (deleteInput === studentId ? '#e53935' : '#f5c6c6'), color: '#fff', border: 'none', borderRadius: '8px', cursor: deleteInput === studentId && !deleteLoading ? 'pointer' : 'not-allowed', fontSize: '14px', fontWeight: 600, transition: 'background-color 0.2s' }}
               >
                 {deleteLoading ? '註銷中...' : '確認註銷'}
               </button>
