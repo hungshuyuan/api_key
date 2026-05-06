@@ -1,8 +1,8 @@
-from sqlalchemy import Column, String, TIMESTAMP, ForeignKey
+from sqlalchemy import Column, String, TIMESTAMP, ForeignKey, Integer
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
-from db import Base
+from db import courseBase as Base
 
 
 class Course(Base):
@@ -35,3 +35,10 @@ class CourseStudent(Base):
     # 關聯
     course = relationship("Course", back_populates="students")
     student = relationship("Student", back_populates="courses")
+
+class ApiKeyRecord(Base):
+    __tablename__ = "api_keys"
+    id = Column(Integer, primary_key=True, index=True)
+    student_id = Column(String, index=True)
+    key_alias = Column(String, index=True)
+    encrypted_raw_key = Column(String)

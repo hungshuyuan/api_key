@@ -21,8 +21,8 @@ from sqlalchemy import create_engine, Column, Integer, String
 from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from cryptography.fernet import Fernet
 
-from db import get_db
-from models import Course, Student, CourseStudent
+from db import get_course_db
+from models import Course, Student, CourseStudent, ApiKeyRecord
 import logging
 
 # 載入環境變數
@@ -60,12 +60,12 @@ SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
 # 定義資料表 Schema
-class ApiKeyRecord(Base):
-    __tablename__ = "api_keys"
-    id = Column(Integer, primary_key=True, index=True)
-    student_id = Column(String, index=True)
-    key_alias = Column(String, index=True)  # 例如: C113118289_1744800000
-    encrypted_raw_key = Column(String)      # 加密後的完整 key（備用）
+# class ApiKeyRecord(Base):
+#     __tablename__ = "api_keys"
+#     id = Column(Integer, primary_key=True, index=True)
+#     student_id = Column(String, index=True)
+#     key_alias = Column(String, index=True)  # 例如: C113118289_1744800000
+#     encrypted_raw_key = Column(String)      # 加密後的完整 key（備用）
 
 # 自動建立資料表
 Base.metadata.create_all(bind=engine)
@@ -378,12 +378,12 @@ async def reveal_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
     raw_key = cipher_suite.decrypt(record.encrypted_raw_key.encode()).decode()
     return {"raw_key": raw_key}
 
-@app.post("/api/course/new")
+@app.post("/api/courses/new")
 async def create_course(
     courseID: str = Form(...),
     courseName: str = Form(...),
     students: UploadFile = File(...),
-    db: Session = Depends(get_db),
+    db: Session = Depends(get_course_db),
 ):
     try:
         # ✅ 檢查 course 是否存在
@@ -456,6 +456,36 @@ async def create_course(
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/courses/keys")
+def generate_keys(
+    courseID: str = Form(...),
+    budget: Optional[float] = Form(None),
+    db: Session = Depends(get_course_db)
+):
+    course = db.query(Course).filter_by(courseID=courseID).first()
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+
+    keys_info = []
+    for cs in course.students:
+        sid = cs.studentID
+        key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}"
+        keys_info.append({
+            "studentID": sid,
+            "key_alias": key_alias,
+            "budget": budget
+        })
+
+    return {
+        "courseID": courseID,
+        "keys": keys_info
+    }
+
+@app.get("/api/courses/list/{studentID}")
+async def list_courses(studentID: str, db: Session = Depends(get_course_db)):
+    courses = db.query(Course).join(CourseStudent).filter(CourseStudent.studentID == studentID).all()
+    return {"courses": courses}
 
 if __name__ == "__main__":
     import uvicorn

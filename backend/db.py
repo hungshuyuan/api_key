@@ -1,26 +1,27 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = "sqlite:///./course.db"  
+COURSE_DATABASE_URL = "sqlite:///./course.db"  
+
 # 👉 production 建議換 PostgreSQL
 
-engine = create_engine(
-    DATABASE_URL,
+courseEngine = create_engine(
+    COURSE_DATABASE_URL,
     connect_args={"check_same_thread": False}  # SQLite only
 )
 
-SessionLocal = sessionmaker(
+courseSessionLocal = sessionmaker(
     autocommit=False,
     autoflush=False,
-    bind=engine
+    bind=courseEngine
 )
 
-Base = declarative_base()
+courseBase = declarative_base()
 
 
 # FastAPI dependency
-def get_db():
-    db = SessionLocal()
+def get_course_db():
+    db = courseSessionLocal()
     try:
         yield db
     finally:
