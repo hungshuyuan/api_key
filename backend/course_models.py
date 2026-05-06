@@ -1,6 +1,7 @@
-from sqlalchemy import Column, String, TIMESTAMP, ForeignKey, Integer
-from sqlalchemy.orm import relationship
 from datetime import datetime
+
+from sqlalchemy import Column, ForeignKey, String, TIMESTAMP
+from sqlalchemy.orm import relationship
 
 from db import courseBase as Base
 
@@ -12,7 +13,6 @@ class Course(Base):
     courseName = Column(String, nullable=False)
     created_at = Column(TIMESTAMP, default=datetime.utcnow)
 
-    # 關聯
     students = relationship("CourseStudent", back_populates="course")
 
 
@@ -32,13 +32,5 @@ class CourseStudent(Base):
     courseID = Column(String, ForeignKey("course.courseID"), primary_key=True)
     studentID = Column(String, ForeignKey("student.studentID"), primary_key=True)
 
-    # 關聯
     course = relationship("Course", back_populates="students")
     student = relationship("Student", back_populates="courses")
-
-class ApiKeyRecord(Base):
-    __tablename__ = "api_keys"
-    id = Column(Integer, primary_key=True, index=True)
-    student_id = Column(String, index=True)
-    key_alias = Column(String, index=True)
-    encrypted_raw_key = Column(String)

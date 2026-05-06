@@ -10,6 +10,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel
 from dotenv import load_dotenv
+from sqlalchemy.orm import Session
 
 from google.oauth2 import id_token
 from google.auth.transport import requests as google_requests
@@ -17,12 +18,26 @@ import jwt
 import httpx
 
 # --- 新增：資料庫與加密套件 ---
-from sqlalchemy import create_engine, Column, Integer, String
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
 from cryptography.fernet import Fernet
 
-from db import get_course_db
-from models import Course, Student, CourseStudent, ApiKeyRecord
+from db import (
+    commit_session,
+    create_api_key_record,
+    create_course_record,
+    create_course_student_relation,
+    create_student_record,
+    delete_api_key_record,
+    get_api_key_record,
+    get_course_db,
+    get_course_record,
+    get_db,
+    get_student_record,
+    get_course_student_relation,
+    init_db,
+    list_api_key_records,
+    list_courses_for_student,
+)
+from course_models import Course
 import logging
 
 # 載入環境變數
@@ -46,39 +61,19 @@ NEW_USER_ROLE = os.getenv("NEW_USER_ROLE", "internal_user")
 
 # 加密 Key (用來加密存進資料庫的 raw_key，防止資料外線。可用 Fernet.generate_key() 產生)
 ENCRYPTION_KEY = os.getenv("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    raise RuntimeError("ENCRYPTION_KEY is required")
 cipher_suite = Fernet(ENCRYPTION_KEY.encode())
 
-# --- 資料庫設定 (預設使用 SQLite：keys.db) ---
-SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./keys.db")
-engine = create_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False} if "sqlite" in SQLALCHEMY_DATABASE_URL else {}
-)
-# 正式上線後要刪除有關邏輯
 TEST = os.getenv("TEST", "false").lower() == "true"
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-# 定義資料表 Schema
-# class ApiKeyRecord(Base):
-#     __tablename__ = "api_keys"
-#     id = Column(Integer, primary_key=True, index=True)
-#     student_id = Column(String, index=True)
-#     key_alias = Column(String, index=True)  # 例如: C113118289_1744800000
-#     encrypted_raw_key = Column(String)      # 加密後的完整 key（備用）
-
-# 自動建立資料表
-Base.metadata.create_all(bind=engine)
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 app = FastAPI(title="NKUST API Key Service")
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    init_db()
 
 # 設定 CORS
 app.add_middleware(
@@ -119,6 +114,10 @@ class KeyResponse(BaseModel):
     max_budget: float        # 帳號預算上限（user 層）
     budget_duration: str     # 重置週期，例如 '7d'
     budget_reset_at: Optional[str]  # 下次重置時間，ISO 格式
+
+class CourseKeyRequest(BaseModel):
+    courseID: str
+    budget: Optional[float] = None
 
 # --- 共用函式：取得學長 API 用的 Header ---
 def get_litellm_headers():
@@ -173,27 +172,31 @@ async def parse_post_payload(request: Request):
 # ==========================================
 # 1. 登入邏輯 (含學長端 /user/info 與 /user/new)
 # ==========================================
-def role_payload(student_id: str):
-    first = student_id[0].upper()
-    if first == "C":
-        max_budget = float(os.getenv("C_MAX_BUDGET", -1))
-        budget_duration = os.getenv("C_BUDGET_DURATION", -1)
-    elif first == "F":
-        max_budget = float(os.getenv("F_MAX_BUDGET", -1))
-        budget_duration = os.getenv("F_BUDGET_DURATION", -1)
-    elif first.isdigit():
-        max_budget = float(os.getenv("T_MAX_BUDGET", -1))
-        budget_duration = os.getenv("T_BUDGET_DURATION", -1)
+def role_payload(user_id: str, isCourse=False):
+    if isCourse:
+        max_budget = float(os.getenv("COURSE_MAX_BUDGET", -1))
+        budget_duration = os.getenv("COURSE_BUDGET_DURATION", -1)
+    else:
+        first = user_id[0].upper()
+        if first == "C":
+            max_budget = float(os.getenv("C_MAX_BUDGET", -1))
+            budget_duration = os.getenv("C_BUDGET_DURATION", -1)
+        elif first == "F":
+            max_budget = float(os.getenv("F_MAX_BUDGET", -1))
+            budget_duration = os.getenv("F_BUDGET_DURATION", -1)
+        elif first.isdigit():
+            max_budget = float(os.getenv("T_MAX_BUDGET", -1))
+            budget_duration = os.getenv("T_BUDGET_DURATION", -1)
 
     # 正式上線後要刪除有關邏輯
     if TEST:
         return {
-            "user_id": student_id,
+            "user_id": user_id,
             "user_role": NEW_USER_ROLE,
             "budget_duration": budget_duration,
         }
     return {
-        "user_id": student_id,
+        "user_id": user_id,
         "max_budget": max_budget,
         "user_role": NEW_USER_ROLE,
         "budget_duration": budget_duration,
@@ -223,7 +226,7 @@ async def google_auth(request: GoogleAuthRequest):
             
             if check_res.status_code == 404:
                 # 若無該用戶，向學長 API 新增用戶
-                role_payload_data = role_payload(student_id)
+                role_payload_data = role_payload(student_id, False)
                 create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=role_payload_data, headers=headers)
                 if create_res.status_code != 200:
                     raise HTTPException(status_code=500, detail="無法在 LiteLLM 系統建立新用戶")
@@ -251,7 +254,7 @@ async def generate_key(student_id: str = Depends(verify_jwt), db: Session = Depe
     logger.info(f"申請 Key 的 student_id: {student_id}, timestamp: {timestamp}")
     payload = {
         "user_id": student_id,
-        "key_alias": f"{student_id}_{timestamp}",
+        "key_alias": f"{student_id}_{timestamp}_private",
         "key_type": "llm_api" # 依學長規格
     }
     
@@ -271,17 +274,10 @@ async def generate_key(student_id: str = Depends(verify_jwt), db: Session = Depe
 
             # 使用 Fernet 將完整 Key 加密後再存入 DB，保護明文安全
             encrypted_key = cipher_suite.encrypt(raw_key.encode()).decode()
-            key_alias = f"{student_id}_{timestamp}"
+            key_alias = f"{student_id}_{timestamp}_private"
 
             # 存入資料庫
-            new_key_record = ApiKeyRecord(
-                student_id=student_id,
-                key_alias=key_alias,
-                encrypted_raw_key=encrypted_key
-            )
-            db.add(new_key_record)
-            db.commit()
-            db.refresh(new_key_record)
+            create_api_key_record(db, student_id, key_alias, encrypted_key)
             
             # 僅在申請當下回傳一次完整 raw_key，之後不再顯示
             return {"message": "申請成功", "key": raw_key}
@@ -314,7 +310,7 @@ async def get_my_keys(student_id: str = Depends(verify_jwt), db: Session = Depen
     budget_reset_at = user_info.get("budget_reset_at")
 
     # 建立 key_alias → db_id 的對應表（用於讓前端拿到刪除所需的 id）
-    db_records = db.query(ApiKeyRecord).filter(ApiKeyRecord.student_id == student_id).all()
+    db_records = list_api_key_records(db, student_id)
     alias_to_id = {r.key_alias: r.id for r in db_records}
 
     result = []
@@ -343,7 +339,7 @@ async def get_my_keys(student_id: str = Depends(verify_jwt), db: Session = Depen
 @app.delete("/api/keys/{key_id}")
 async def delete_key(key_id: int, student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
     # 1. 驗證身分 (確保該 Key 屬於發出請求的學號)
-    record = db.query(ApiKeyRecord).filter(ApiKeyRecord.id == key_id, ApiKeyRecord.student_id == student_id).first()
+    record = get_api_key_record(db, key_id, student_id)
     if not record:
         raise HTTPException(status_code=404, detail="找不到此 API Key 或無權限")
 
@@ -357,8 +353,7 @@ async def delete_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
             )
 
             # 3. 從本地資料庫刪除紀錄
-            db.delete(record)
-            db.commit()
+            delete_api_key_record(db, record)
 
             return {"message": "註銷成功"}
 
@@ -372,7 +367,7 @@ async def delete_key(key_id: int, student_id: str = Depends(verify_jwt), db: Ses
 # ==========================================
 @app.get("/api/keys/{key_id}/reveal")
 async def reveal_key(key_id: int, student_id: str = Depends(verify_jwt), db: Session = Depends(get_db)):
-    record = db.query(ApiKeyRecord).filter(ApiKeyRecord.id == key_id, ApiKeyRecord.student_id == student_id).first()
+    record = get_api_key_record(db, key_id, student_id)
     if not record:
         raise HTTPException(status_code=404, detail="找不到此 API Key 或無權限")
     raw_key = cipher_suite.decrypt(record.encrypted_raw_key.encode()).decode()
@@ -386,18 +381,21 @@ async def create_course(
     db: Session = Depends(get_course_db),
 ):
     try:
-        # ✅ 檢查 course 是否存在
-        existing = db.query(Course).filter_by(courseID=courseID).first()
-        if existing:
-            raise HTTPException(status_code=400, detail="Course already exists")
+        async with httpx.AsyncClient() as client:
+            headers = get_litellm_headers()
+            check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={courseID}", headers=headers)
+            if check_res.status_code == 404:
+                role_payload_data = role_payload(courseID, True)
+                create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=role_payload_data, headers=headers)
+                if create_res.status_code != 200:
+                    raise HTTPException(status_code=500, detail="無法在系統建立新用戶")
+            elif check_res.status_code != 200:
+                raise HTTPException(status_code=500, detail="系統連線發生錯誤")
+            else:
+                raise HTTPException(status_code=400, detail="Course ID 已存在於系統")
 
         # ✅ 建立 course
-        new_course = Course(
-            courseID=courseID,
-            courseName=courseName,
-            created_at=datetime.utcnow()
-        )
-        db.add(new_course)
+        create_course_record(db, courseID, courseName, datetime.utcnow())
 
         # ✅ 讀 XML
         content = await students.read()
@@ -428,24 +426,17 @@ async def create_course(
             name = s["studentName"]
 
             # student
-            student = db.query(Student).filter_by(studentID=sid).first()
+            student = get_student_record(db, sid)
             if not student:
-                student = Student(
-                    studentID=sid,
-                    studentName=name
-                )
-                db.add(student)
+                create_student_record(db, sid, name)
 
             # relation（避免重複）
-            exists = db.query(CourseStudent).filter_by(
-                courseID=courseID,
-                studentID=sid
-            ).first()
+            exists = get_course_student_relation(db, courseID, sid)
 
             if not exists:
-                db.add(CourseStudent(courseID=courseID, studentID=sid))
+                create_course_student_relation(db, courseID, sid)
 
-        db.commit()
+        commit_session(db)
 
         return {
             "message": "Course created",
@@ -458,35 +449,78 @@ async def create_course(
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/api/courses/keys")
-def generate_keys(
-    courseID: str = Form(...),
-    budget: Optional[float] = Form(None),
-    db: Session = Depends(get_course_db)
+async def generate_course_keys(
+    body: CourseKeyRequest, 
+    course_db: Session = Depends(get_course_db),
+    key_db: Session = Depends(get_db)
 ):
-    course = db.query(Course).filter_by(courseID=courseID).first()
+    courseID = body.courseID
+    budget = body.budget or 0.0
+    course = get_course_record(course_db, courseID)
     if not course:
-        raise HTTPException(status_code=404, detail="Course not found")
+        raise HTTPException(status_code=404, detail="Course not found in database, please create course first!")
 
-    keys_info = []
+    async with httpx.AsyncClient() as client:
+        headers = get_litellm_headers()
+        check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={courseID}", headers=headers)
+        if check_res.status_code == 404:
+            # 若無該用戶，向學長 API 新增用戶
+            raise HTTPException(status_code=404, detail="Course not found in system, please create course first!")
+        if check_res.status_code != 200:
+            raise HTTPException(status_code=500, detail="System connection error")
+        if check_res.status_code == 200:
+            course_info = check_res.json().get("user_info", {})
+            if course_info.get("max_budget") < len(course.students) * budget:
+                raise HTTPException(status_code=400, detail="預算不足以覆蓋所有學生，請重新調整預算")
+    result = []
+    course_payload = role_payload(courseID, True)
     for cs in course.students:
         sid = cs.studentID
-        key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}"
-        keys_info.append({
-            "studentID": sid,
-            "key_alias": key_alias,
-            "budget": budget
-        })
+        key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}_course"
+        async with httpx.AsyncClient() as client:
+            try:
+                response = await client.post(
+                    f"{LITELLM_API_BASE}/key/generate",
+                    json=course_payload,
+                    headers=get_litellm_headers()
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                raw_key = data.get("key")
+                if not raw_key:
+                    raise HTTPException(status_code=500, detail="學長 API 未回傳有效的 Key")
+
+                # 使用 Fernet 將完整 Key 加密後再存入 DB，保護明文安全
+                encrypted_key = cipher_suite.encrypt(raw_key.encode()).decode()
+                key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}_course"
+
+                # 存入資料庫
+                create_api_key_record(key_db, courseID, key_alias, encrypted_key)
+            except httpx.HTTPStatusError as e:
+                logger.error(f"🚨 學長 API 錯誤: {e.response.text}")
+                raise HTTPException(status_code=e.response.status_code, detail="申請金鑰失敗")
 
     return {
         "courseID": courseID,
-        "keys": keys_info
+        "keys": result
     }
 
 @app.get("/api/courses/list/{studentID}")
-async def list_courses(studentID: str, db: Session = Depends(get_course_db)):
-    courses = db.query(Course).join(CourseStudent).filter(CourseStudent.studentID == studentID).all()
-    return {"courses": courses}
+async def list_courses(studentID: str, course_db: Session = Depends(get_course_db)):
+    courses = list_courses_for_student(course_db, studentID)
+    return {
+        "courses": [
+            {
+                "courseName": course.courseName,
+                "courseID": course.courseID,
+                "created_at": course.created_at,
+            }
+            for course in courses
+        ]
+    }
+
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
