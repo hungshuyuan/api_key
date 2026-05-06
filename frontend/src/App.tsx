@@ -18,13 +18,9 @@ interface KeyInfo {
 }
 
 interface CourseInfo {
-  id: number;
-  name: string;
-  std_api_key: string;
-  spend: number;
-  max_budget: number;
-  budget_duration: string;
-  budget_reset_at: string | null;
+  courseName: string;
+  courseID: string;
+  created_at: string;
 }
 
 function App() {
@@ -91,10 +87,11 @@ function App() {
 
   const fetchCourse = async (currentToken: string) => {
     try {
-      const res = await axios.get(`${API_BASE_URL}/api/course`, {
+      const res = await axios.get(`${API_BASE_URL}/api/courses/list/${studentId}`, {
         headers: { Authorization: `Bearer ${currentToken}` }
       });
-      setCourse(res.data);
+      console.log("課程列表", res.data.courses);
+      setCourse(res.data.courses);
     } catch (error) {
       console.error("載入課程列表失敗", error);
       setErrorMsg("無法載入課程列表");
@@ -120,9 +117,12 @@ function App() {
       // 2. 向學長端 GET /user/info?user_id={學號}。
       // 3. 若 404，則 POST /user/new 建立用戶。
       // 4. 最後回傳 JWT (access_token) 給前端。
-      const res = await axios.post(`${API_BASE_URL}/api/auth/google`, {
+      const res = await axios.post(`https://nkustapikey.54ucl.com/api/auth/google`, {
         token: credentialResponse.credential,
       });
+      // const res = await axios.post(`${API_BASE_URL}/api/auth/google`, {
+      //   token: credentialResponse.credential,
+      // });
       setToken(res.data.access_token);
       setStudentId(res.data.student_id);
       localStorage.setItem('token', res.data.access_token);
@@ -466,10 +466,7 @@ function App() {
                 <Dropdown
                   options={[
                     { id: 'private', label: '私人 API Keys' },
-                    // { id: '2', label: '物聯網' },
-                    // { id: '3', label: '物件導向程式設計' },
-                    // { id: '4', label: '資料庫管理' },
-                    ...(course ? course.map((c) => ({ id: c.id.toString(), label: c.name.toString() })) : [])
+                    ...course.map(c => ({ id: c.courseID, label: c.courseName }))
                   ]}
                   onSelect={(option) => setSelectedFilter(option)}
                   placeholder="篩選..."
