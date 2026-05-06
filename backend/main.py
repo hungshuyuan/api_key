@@ -43,7 +43,7 @@ import logging
 # 載入環境變數
 load_dotenv()
 router = APIRouter()
-logger = logging.getLogger("__uvicorn__")
+logger = logging.getLogger("uvicorn.error")
 
 # --- 環境變數與驗證設定 ---
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID")
@@ -119,6 +119,11 @@ class CourseKeyRequest(BaseModel):
     courseID: str
     budget: Optional[float] = None
 
+class UpdateCourseKeyRequest(BaseModel):
+    courseID: str
+    updateBudget: Optional[float] = None
+    studentID: str
+
 # --- 共用函式：取得學長 API 用的 Header ---
 def get_litellm_headers():
     return {
@@ -126,55 +131,12 @@ def get_litellm_headers():
         "Content-Type": "application/json"
     }
 
-
-def _xml_element_to_value(element: ET.Element):
-    children = list(element)
-    if not children:
-        text = (element.text or "").strip()
-        return text
-
-    result = {}
-    for child in children:
-        child_value = _xml_element_to_value(child)
-        if child.tag in result:
-            if not isinstance(result[child.tag], list):
-                result[child.tag] = [result[child.tag]]
-            result[child.tag].append(child_value)
-        else:
-            result[child.tag] = child_value
-    return result
-
-
-async def parse_post_payload(request: Request):
-    content_type = (request.headers.get("content-type") or "").lower()
-    raw_body = await request.body()
-    text_body = raw_body.decode("utf-8", errors="replace").strip()
-
-    if not text_body:
-        return "empty", None
-
-    if "json" in content_type:
-        return "json", json.loads(text_body)
-
-    if "xml" in content_type:
-        root = ET.fromstring(text_body)
-        return "xml", {root.tag: _xml_element_to_value(root)}
-
-    try:
-        return "json", json.loads(text_body)
-    except json.JSONDecodeError:
-        try:
-            root = ET.fromstring(text_body)
-            return "xml", {root.tag: _xml_element_to_value(root)}
-        except ET.ParseError:
-            return "text", text_body
-
 # ==========================================
 # 1. 登入邏輯 (含學長端 /user/info 與 /user/new)
 # ==========================================
 def role_payload(user_id: str, isCourse=False):
     if isCourse:
-        max_budget = float(os.getenv("COURSE_MAX_BUDGET", -1))
+        max_budget = os.getenv("COURSE_BUDGET", -1)
         budget_duration = os.getenv("COURSE_BUDGET_DURATION", -1)
     else:
         first = user_id[0].upper()
@@ -189,17 +151,19 @@ def role_payload(user_id: str, isCourse=False):
             budget_duration = os.getenv("T_BUDGET_DURATION", -1)
 
     # 正式上線後要刪除有關邏輯
-    if TEST:
-        return {
-            "user_id": user_id,
-            "user_role": NEW_USER_ROLE,
-            "budget_duration": budget_duration,
-        }
+    # if TEST:
+    #     return {
+    #         "user_id": user_id,
+    #         "user_role": NEW_USER_ROLE,
+    #         "budget_duration": budget_duration,
+    #         "auto_create_key": False,
+    #     }
     return {
         "user_id": user_id,
         "max_budget": max_budget,
         "user_role": NEW_USER_ROLE,
         "budget_duration": budget_duration,
+        "auto_create_key": False,
     }
 
 @app.post("/api/auth/google", response_model=AuthResponse)
@@ -380,6 +344,7 @@ async def create_course(
     students: UploadFile = File(...),
     db: Session = Depends(get_course_db),
 ):
+    # 為課程建立一筆紀錄，並解析上傳的 XML 學生清單，將學生與課程的關係寫入資料庫
     try:
         async with httpx.AsyncClient() as client:
             headers = get_litellm_headers()
@@ -388,16 +353,20 @@ async def create_course(
                 role_payload_data = role_payload(courseID, True)
                 create_res = await client.post(f"{LITELLM_API_BASE}/user/new", json=role_payload_data, headers=headers)
                 if create_res.status_code != 200:
-                    raise HTTPException(status_code=500, detail="無法在系統建立新用戶")
+                    error_detail = create_res.text
+                    logger.error(f"無法在系統建立新用戶: {error_detail}")
+                    raise HTTPException(status_code=500, detail=f"無法在系統建立新用戶: {error_detail}")
             elif check_res.status_code != 200:
-                raise HTTPException(status_code=500, detail="系統連線發生錯誤")
+                error_detail = check_res.text
+                logger.error(f"系統連線發生錯誤: {error_detail}")
+                raise HTTPException(status_code=500, detail=f"系統連線發生錯誤: {error_detail}")
             else:
-                raise HTTPException(status_code=400, detail="Course ID 已存在於系統")
+                raise HTTPException(status_code=400, detail=f"Course ID ({courseID}) 已存在於系統")
 
-        # ✅ 建立 course
+        # 建立 course
         create_course_record(db, courseID, courseName, datetime.utcnow())
 
-        # ✅ 讀 XML
+        # 讀 XML
         content = await students.read()
 
         try:
@@ -420,7 +389,7 @@ async def create_course(
                     "studentName": name
                 })
 
-        # ✅ 寫入 DB
+        # 寫入 DB
         for s in student_data:
             sid = s["studentID"]
             name = s["studentName"]
@@ -448,12 +417,13 @@ async def create_course(
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/courses/keys")
+@app.post("/api/courses/keys/generate")
 async def generate_course_keys(
     body: CourseKeyRequest, 
     course_db: Session = Depends(get_course_db),
     key_db: Session = Depends(get_db)
 ):
+    # 為本課程的每個學生申請一組 Key，並存入資料庫
     courseID = body.courseID
     budget = body.budget or 0.0
     course = get_course_record(course_db, courseID)
@@ -464,7 +434,6 @@ async def generate_course_keys(
         headers = get_litellm_headers()
         check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={courseID}", headers=headers)
         if check_res.status_code == 404:
-            # 若無該用戶，向學長 API 新增用戶
             raise HTTPException(status_code=404, detail="Course not found in system, please create course first!")
         if check_res.status_code != 200:
             raise HTTPException(status_code=500, detail="System connection error")
@@ -472,16 +441,24 @@ async def generate_course_keys(
             course_info = check_res.json().get("user_info", {})
             if course_info.get("max_budget") < len(course.students) * budget:
                 raise HTTPException(status_code=400, detail="預算不足以覆蓋所有學生，請重新調整預算")
-    result = []
-    course_payload = role_payload(courseID, True)
-    for cs in course.students:
-        sid = cs.studentID
-        key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}_course"
-        async with httpx.AsyncClient() as client:
-            try:
+            
+    keys = []
+    created_aliases = []
+    try:
+        for cs in course.students:
+            sid = cs.studentID
+            key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}_course"
+            payload = {
+                "user_id": courseID,
+                "key_alias": key_alias,
+                "key_type": "llm_api", # 依學長規格
+                "max_budget": budget
+            }
+            
+            async with httpx.AsyncClient() as client:
                 response = await client.post(
                     f"{LITELLM_API_BASE}/key/generate",
-                    json=course_payload,
+                    json=payload,
                     headers=get_litellm_headers()
                 )
                 response.raise_for_status()
@@ -491,23 +468,41 @@ async def generate_course_keys(
                 if not raw_key:
                     raise HTTPException(status_code=500, detail="學長 API 未回傳有效的 Key")
 
+                # 紀錄成功建立的別名以便失敗時回滾
+                created_aliases.append(key_alias)
+
                 # 使用 Fernet 將完整 Key 加密後再存入 DB，保護明文安全
                 encrypted_key = cipher_suite.encrypt(raw_key.encode()).decode()
-                key_alias = f"{sid}_{int(datetime.utcnow().timestamp())}_course"
 
                 # 存入資料庫
-                create_api_key_record(key_db, courseID, key_alias, encrypted_key)
-            except httpx.HTTPStatusError as e:
-                logger.error(f"🚨 學長 API 錯誤: {e.response.text}")
-                raise HTTPException(status_code=e.response.status_code, detail="申請金鑰失敗")
+                create_api_key_record(key_db, sid, key_alias, encrypted_key)
+                
+                # 僅在申請當下回傳一次完整 raw_key，之後不再顯示
+                keys.append({"studentID": sid, "key": raw_key})
+
+    except Exception as e:
+        logger.error(f"🚨 批量申請金鑰失敗，正在嘗試清理已建立的資產: {str(e)}")
+        if created_aliases:
+            async with httpx.AsyncClient() as client:
+                try:
+                    await client.post(
+                        f"{LITELLM_API_BASE}/key/delete",
+                        json={"key_aliases": created_aliases},
+                        headers=get_litellm_headers()
+                    )
+                except Exception as cleanup_err:
+                    logger.error(f"清理失敗的金鑰時出錯: {cleanup_err}")
+        # 回退資料庫變更由 SQLAlchemy Session 管理（若有外部事務）
+        raise HTTPException(status_code=500, detail=f"批量申請失敗: {str(e)}")
 
     return {
         "courseID": courseID,
-        "keys": result
+        "keys": keys
     }
 
-@app.get("/api/courses/list/{studentID}")
-async def list_courses(studentID: str, course_db: Session = Depends(get_course_db)):
+@app.get("/api/courses/list")
+async def list_courses(studentID: str = Depends(verify_jwt), course_db: Session = Depends(get_course_db)):
+    # 取得學生的課程列表（只回傳 courseID、courseName、created_at）
     courses = list_courses_for_student(course_db, studentID)
     return {
         "courses": [
@@ -520,6 +515,131 @@ async def list_courses(studentID: str, course_db: Session = Depends(get_course_d
         ]
     }
 
+@app.get("/api/courses/keys")
+async def get_course_keys(courseID: str, studentID: str = Depends(verify_jwt), course_db: Session = Depends(get_course_db), key_db: Session = Depends(get_db)):
+    # 回傳該課程該學生的所有金鑰資訊（包含每個 key 的用量、整體預算與用量等）
+    try:
+        course = get_course_record(course_db, courseID)
+        if not course:
+            raise HTTPException(status_code=404, detail="Course not found")
+
+        # 確認學生是否在課程中
+        relation = get_course_student_relation(course_db, courseID, studentID)
+        logger.info(f"學生 {studentID} 嘗試存取課程 {courseID} 的金鑰資訊，relation: {relation}")
+        if not relation:
+            raise HTTPException(status_code=403, detail="You are not enrolled in this course")
+        async with httpx.AsyncClient() as client:
+            res = await client.get(
+                f"{LITELLM_API_BASE}/user/info?user_id={courseID}",
+                headers=get_litellm_headers()
+            )
+            if res.status_code != 200:
+                raise HTTPException(status_code=502, detail="無法取得用量資訊")
+            course_data = res.json()
+        
+        user_info = course_data.get("user_info", {})
+        litellm_keys = course_data.get("keys", [])
+        budget_duration = user_info.get("budget_duration") or "N/A"
+        budget_reset_at = user_info.get("budget_reset_at")
+        # 建立 key_alias → db_id 的對應表（用於讓前端拿到刪除所需的 id）
+        db_records = list_api_key_records(key_db, studentID)
+        alias_to_id = {r.key_alias: r.id for r in db_records}
+        std_key = [
+            k for k in litellm_keys
+            if k.get("key_alias", "").startswith(f"{studentID}_")
+        ]
+        key_budget_count = 0
+        key_spend_count = 0
+        result = []
+        for k in std_key:
+            token = k.get("token", "")
+            alias = k.get("key_alias", "")
+            db_id = alias_to_id.get(alias)
+            if db_id is None:
+                continue  # 不在自己 DB 的 key（非本系統申請），略過
+            async with httpx.AsyncClient() as client:
+                try:
+                    info_res = await client.get(
+                        f"{LITELLM_API_BASE}/key/info?key={token}",
+                        headers=get_litellm_headers()
+                    )
+                    if info_res.status_code == 200:
+                        info_data = info_res.json()
+                        key_budget_count += info_data.get("info").get("max_budget", 0.0) or 0.0
+                        key_spend_count += info_data.get("info").get("spend", 0.0) or 0.0
+                    else:
+                        logger.error(f"無法取得金鑰資訊，key_alias: {alias}, status_code: {info_res.status_code}, response: {info_res.text}")
+                        k["spend"] = 0.0
+                except Exception as e:
+                    logger.error(f"呼叫學長 API 失敗，key_alias: {alias}, error: {str(e)}")
+                    k["spend"] = 0.0
+            logger.info(f"key_spend_count: {key_spend_count}, key_budget_count: {key_budget_count}")
+            result.append({
+                "id": db_id,
+                "key_name": k.get("key_name", ""),
+                "key_alias": alias,
+                "spend": k.get("spend", 0.0) or 0.0,
+                "user_total_spend": key_spend_count,
+                "max_budget": key_budget_count,
+                "budget_duration": budget_duration,
+                "budget_reset_at": budget_reset_at,
+            })
+
+        return result
+    except Exception as e:
+        logger.error(f"Error in get_course_keys: {e}")
+        raise HTTPException(status_code=500, detail="取得課程金鑰資訊失敗")
+
+@app.post("/api/courses/keys/update_budget")
+async def update_course_key_budget(body: UpdateCourseKeyRequest, course_db: Session = Depends(get_course_db), key_db: Session = Depends(get_db)):
+    # 更新該課程該學生的金鑰預算
+    courseID = body.courseID
+    update_budget = body.updateBudget or 0.0
+    stdid = body.studentID
+    course = get_course_record(course_db, courseID)
+    if not course:
+        raise HTTPException(status_code=404, detail="Course not found")
+    async with httpx.AsyncClient() as client:
+        headers = get_litellm_headers()
+        check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={courseID}", headers=headers)
+        if check_res.status_code == 404:
+            raise HTTPException(status_code=404, detail="Course not found in system, please create course first!")
+        if check_res.status_code != 200:
+            raise HTTPException(status_code=500, detail="System connection error")
+        if check_res.status_code == 200:
+            check_res = check_res.json()
+            course_info = check_res.get("user_info", {})
+            budget_count = 0.0
+            stdkey = []
+            for k in check_res.get("keys", []):
+                if k.get("key_alias", "").startswith(f"{stdid}_"):
+                    stdkey.append(k)
+                else:
+                    budget_count += k.get("max_budget", 0.0) or 0.0
+                
+            if budget_count + len(stdkey) * update_budget > course_info.get("max_budget", 0.0):
+                raise HTTPException(status_code=400, detail="調整預算後超出課程總預算，請重新調整")
+            else:
+                for k in stdkey:
+                    token = k.get("token", "")
+                    key_alias = k.get("key_alias", "")
+                    async with httpx.AsyncClient() as client:
+                        try:
+                            result = await client.post(
+                                f"{LITELLM_API_BASE}/key/update",
+                                json={"key": token, "max_budget": update_budget},
+                                headers=get_litellm_headers()
+                            )
+                            if result.status_code != 200:
+                                logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, status_code: {result.status_code}, response: {result.text}")
+                                raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {result.text}")
+                            if result.status_code == 200:
+                                logger.info(f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}")
+                                return {"message": "success", "detail": f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}"}
+                        except Exception as e:
+                            logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, error: {str(e)}")
+                            raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {str(e)}")
+            
 
 if __name__ == "__main__":
     import uvicorn
