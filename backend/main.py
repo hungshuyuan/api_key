@@ -451,7 +451,7 @@ async def generate_course_keys(
             payload = {
                 "user_id": courseID,
                 "key_alias": key_alias,
-                "key_type": "llm_api", # 依學長規格
+                "key_type": NEW_USER_ROLE, # 依學長規格
                 "max_budget": budget
             }
             

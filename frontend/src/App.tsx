@@ -207,12 +207,12 @@ function App() {
       // 2. 向學長端 GET /user/info?user_id={學號}。
       // 3. 若 404，則 POST /user/new 建立用戶。
       // 4. 最後回傳 JWT (access_token) 給前端。
-      const res = await axios.post(`https://nkustapikey.54ucl.com/api/auth/google`, {
-        token: credentialResponse.credential,
-      });
-      // const res = await axios.post(`${API_BASE_URL}/api/auth/google`, {
+      // const res = await axios.post(`https://nkustapikey.54ucl.com/api/auth/google`, {
       //   token: credentialResponse.credential,
       // });
+      const res = await axios.post(`${API_BASE_URL}/api/auth/google`, {
+        token: credentialResponse.credential,
+      });
       setToken(res.data.access_token);
       setStudentId(res.data.student_id);
       localStorage.setItem('token', res.data.access_token);
@@ -294,10 +294,22 @@ function App() {
 
   const handleCopyKey = async (textToCopy: string) => {
     try {
-      await navigator.clipboard.writeText(textToCopy);
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        await navigator.clipboard.writeText(textToCopy);
+      } else {
+        // Fallback for older browsers or non-secure contexts
+        const textArea = document.createElement('textarea');
+        textArea.value = textToCopy;
+        textArea.style.position = 'fixed';
+        textArea.style.opacity = '0';
+        document.body.appendChild(textArea);
+        textArea.select();
+        document.execCommand('copy');
+        document.body.removeChild(textArea);
+      }
       alert("已複製 API Key！");
     } catch (err) {
-      setErrorMsg("複製失敗，請手動選取複製。");
+      setErrorMsg("複製失敗，請手動選取複製。" + (err instanceof Error ? err.message : ''));
     }
   };
 
