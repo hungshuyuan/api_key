@@ -595,13 +595,21 @@ async def update_course_key_budget(body: UpdateCourseKeyRequest, course_db: Sess
     # 更新該課程該學生的金鑰預算
     courseID = body.courseID
     update_budget = body.updateBudget or 0.0
-    stdid = body.studentID
+    keyid = body.keyID
     course = get_course_record(course_db, courseID)
     if not course:
         raise HTTPException(status_code=404, detail="Course not found")
     async with httpx.AsyncClient() as client:
         headers = get_litellm_headers()
         check_res = await client.get(f"{LITELLM_API_BASE}/user/info?user_id={courseID}", headers=headers)
+        update_key_info = await client.get(
+            f"{LITELLM_API_BASE}/key/info?key={keyid}",
+            headers=get_litellm_headers()
+        )
+        if update_key_info.status_code != 200:
+            logger.error(f"無法取得金鑰資訊，keyID: {keyid}, status_code: {update_key_info.status_code}, response: {update_key_info.text}")
+            raise HTTPException(status_code=500, detail="無法取得金鑰資訊")
+        update_key_info = update_key_info.json()
         if check_res.status_code == 404:
             raise HTTPException(status_code=404, detail="Course not found in system, please create course first!")
         if check_res.status_code != 200:
@@ -609,37 +617,50 @@ async def update_course_key_budget(body: UpdateCourseKeyRequest, course_db: Sess
         if check_res.status_code == 200:
             check_res = check_res.json()
             course_info = check_res.get("user_info", {})
-            budget_count = 0.0
-            stdkey = []
-            for k in check_res.get("keys", []):
-                if k.get("key_alias", "").startswith(f"{stdid}_"):
-                    stdkey.append(k)
-                else:
-                    budget_count += k.get("max_budget", 0.0) or 0.0
-                
-            if budget_count + len(stdkey) * update_budget > course_info.get("max_budget", 0.0):
+            total_distributed_budget = sum([i.get("max_budget", 0.0) or 0.0 for i in course_info.get("keys", [])])
+            update_key_max_budget = update_key_info.get("info", {}).get("max_budget", 0.0) or 0.0
+            if course_info.get("max_budget", 0.0) < total_distributed_budget - update_key_max_budget + update_budget:
                 raise HTTPException(status_code=400, detail="調整預算後超出課程總預算，請重新調整")
-            else:
-                for k in stdkey:
-                    token = k.get("token", "")
-                    key_alias = k.get("key_alias", "")
-                    async with httpx.AsyncClient() as client:
-                        try:
-                            result = await client.post(
-                                f"{LITELLM_API_BASE}/key/update",
-                                json={"key": token, "max_budget": update_budget},
-                                headers=get_litellm_headers()
-                            )
-                            if result.status_code != 200:
-                                logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, status_code: {result.status_code}, response: {result.text}")
-                                raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {result.text}")
-                            if result.status_code == 200:
-                                logger.info(f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}")
-                                return {"message": "success", "detail": f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}"}
-                        except Exception as e:
-                            logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, error: {str(e)}")
-                            raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {str(e)}")
-            
+            result = await client.post(
+                f"{LITELLM_API_BASE}/key/update",
+                json={"key": keyid, "max_budget": update_budget},
+                headers=get_litellm_headers()
+            )
+            if result.status_code != 200:
+                logger.error(f"更新金鑰預算失敗，keyID: {keyid}, status_code: {result.status_code}, response: {result.text}")
+                raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {result.text}")
+            if result.status_code == 200:
+                logger.info(f"成功更新金鑰預算，keyID: {keyid}, new_budget: {update_budget}")
+                return {"message": "success", "detail": f"成功更新金鑰預算，keyID: {keyid}, new_budget: {update_budget}"}
+            # stdkey = []
+            # for k in check_res.get("keys", []):
+            #     if k.get("key_alias", "").startswith(f"{stdid}_"):
+            #         stdkey.append(k)
+            #     else:
+            #         budget_count += k.get("max_budget", 0.0) or 0.0
+                
+            # if budget_count + len(stdkey) * update_budget > course_info.get("max_budget", 0.0):
+            #     raise HTTPException(status_code=400, detail="調整預算後超出課程總預算，請重新調整")
+            # else:
+            #     for k in stdkey:
+            #         token = k.get("token", "")
+            #         key_alias = k.get("key_alias", "")
+            #         async with httpx.AsyncClient() as client:
+            #             try:
+            #                 result = await client.post(
+            #                     f"{LITELLM_API_BASE}/key/update",
+            #                     json={"key": token, "max_budget": update_budget},
+            #                     headers=get_litellm_headers()
+            #                 )
+            #                 if result.status_code != 200:
+            #                     logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, status_code: {result.status_code}, response: {result.text}")
+            #                     raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {result.text}")
+            #                 if result.status_code == 200:
+            #                     logger.info(f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}")
+            #                     return {"message": "success", "detail": f"成功更新金鑰預算，key_alias: {key_alias}, new_budget: {update_budget}"}
+            #             except Exception as e:
+            #                 logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, error: {str(e)}")
+            #                 raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
