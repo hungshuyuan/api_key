@@ -37,6 +37,7 @@ from db import (
     list_api_key_records,
     list_courses_for_student,
     get_key_record_by_alias,
+    get_full_key_by_key_alias
 )
 from course_models import Course
 import logging
@@ -122,7 +123,7 @@ class CourseKeyRequest(BaseModel):
 
 class UpdateCourseKeyRequest(BaseModel):
     updateBudget: Optional[float] = None
-    key: str
+    key_alias: str
 
 # --- 共用函式：取得學長 API 用的 Header ---
 def get_litellm_headers():
@@ -594,7 +595,10 @@ async def get_course_keys(courseID: str, studentID: str = Depends(verify_jwt), c
 async def update_course_key_budget(body: UpdateCourseKeyRequest, course_db: Session = Depends(get_course_db), key_db: Session = Depends(get_db)):
     # 更新該課程該學生的金鑰預算
     update_budget = body.updateBudget or 0.0
-    full_key = body.key
+    key_alias = body.key_alias
+    decode_key = get_full_key_by_key_alias(key_db, key_alias)
+    full_key = cipher_suite.decrypt(decode_key.encrypted_raw_key.encode()).decode()
+    logger.info(f"更新金鑰預算請求，key_alias: {key_alias}, full_key: {full_key}, update_budget: {update_budget}")
     async with httpx.AsyncClient() as client:
         headers = get_litellm_headers()
         update_key_info = await client.get(

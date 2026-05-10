@@ -282,6 +282,20 @@ def create_course_student_relation(db: Session, course_id: str, student_id: str)
     db.add(relation)
     return relation
 
+def get_full_key_by_key_alias(db: Session, key_alias: str):
+    """Fetch the full API key record by its alias.
+
+    Args:
+        db: Active key database session.
+        key_alias: External key alias to search for.
+
+    Returns:
+        The matching API key record or ``None``.
+    """
+    from key_models import ApiKeyRecord
+
+    return db.query(ApiKeyRecord).filter_by(key_alias=key_alias).first()
+
 
 def commit_session(db: Session):
     """Commit the current transaction for a session.
