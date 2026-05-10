@@ -155,7 +155,7 @@ function App() {
       // 呼叫自己的後端。後端負責去 DB 撈出這個學號所有的 Key，
       // 並逐一向學長端 GET /key/info 取得 current_spend 與 max_budget 後合併回傳。
       if (isCourse) {
-        const res = await axios.get(`${API_BASE_URL}/api/courses/keys/?courseID=${selectedFilter?.id}`, {
+        const res = await axios.get(`${API_BASE_URL}/api/courses/keys?courseID=${selectedFilter?.id}`, {
           headers: { Authorization: `Bearer ${currentToken}` }
         });
         setKeys(res.data)

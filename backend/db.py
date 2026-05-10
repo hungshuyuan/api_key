@@ -136,6 +136,21 @@ def get_api_key_record(db: Session, key_id: int, student_id: str):
         ApiKeyRecord.student_id == student_id,
     ).first()
 
+def get_key_record_by_alias(db: Session, key_alias: str):
+    """Get a single API key record by its alias and owner.
+
+    Args:
+        db: Active key database session.
+        key_alias: External key alias to search for.
+    
+    returns:
+        The matching API key record or ``None``.
+    """
+    from key_models import ApiKeyRecord
+
+    return db.query(ApiKeyRecord).filter(
+        ApiKeyRecord.key_alias == key_alias,
+    ).all()
 
 def delete_api_key_record(db: Session, record):
     """Delete an API key record and commit the change.

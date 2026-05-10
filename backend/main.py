@@ -36,6 +36,7 @@ from db import (
     init_db,
     list_api_key_records,
     list_courses_for_student,
+    get_key_record_by_alias,
 )
 from course_models import Course
 import logging
@@ -662,6 +663,47 @@ async def update_course_key_budget(body: UpdateCourseKeyRequest, course_db: Sess
             #                 logger.error(f"更新金鑰預算失敗，key_alias: {key_alias}, error: {str(e)}")
             #                 raise HTTPException(status_code=500, detail=f"更新金鑰預算失敗: {str(e)}")
 
+@app.get("/api/courses/keys/list")
+async def list_course_keys(course_id: str, db: Session = Depends(get_db)):
+    async with httpx.AsyncClient() as client:
+        res = await client.get(
+            f"{LITELLM_API_BASE}/user/info?user_id={course_id}",
+            headers=get_litellm_headers()
+        )
+        if res.status_code != 200:
+            raise HTTPException(status_code=502, detail="無法取得用量資訊")
+        data = res.json()
+
+    user_info = data.get("user_info", {})
+    litellm_keys = data.get("keys", [])
+    max_budget = user_info.get("max_budget", 0.0) or 0.0
+    course_total_spend = user_info.get("spend", 0.0) or 0.0
+    budget_duration = user_info.get("budget_duration") or "N/A"
+    budget_reset_at = user_info.get("budget_reset_at")
+
+    result = {
+        "course_info": {
+            "max_budget": max_budget,
+            "course_total_spend": course_total_spend,
+            "budget_duration": budget_duration,
+            "budget_reset_at": budget_reset_at,
+        },
+        "keys": []
+    }
+    for k in litellm_keys:
+        alias = k.get("key_alias", "")
+        db_id = get_key_record_by_alias(db, alias)
+        if db_id is None:
+            continue  # 不在自己 DB 的 key（非本系統申請），略過
+        result["keys"].append({
+            "id": db_id,
+            "key_name": k.get("key_name", ""),
+            "key_alias": alias,
+            "spend": k.get("spend", 0.0) or 0.0,
+            "max_budget": k.get("max_budget", 0.0) or 0.0
+        })
+
+    return result
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000, reload=True)
