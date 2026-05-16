@@ -43,7 +43,7 @@ console.log([
   "======`-.____`-.___\\_____/___.-`____.-'======",
   "                   `=---='",
   "^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^",
-].join('\n'), 'color: #fad144;');
+].join('\n'), 'color: #777DA7;');
 console.log('%c     佛祖保佑   T_T    永無BUG', 'color: #777DA7;font-size: 16px;font-weight: bold');
 
 console.log(`%c
