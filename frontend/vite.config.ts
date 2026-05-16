@@ -9,6 +9,10 @@ export default defineConfig({
   // 這會強制將打包後的 HTML 資源引用路徑修正為 /apply/assets/index-xxx.css
   base: '/apply/',
 
+  build: {
+    outDir: 'apply' // 將預設的 'dist' 改為 'build'
+  },
+
   server: {
     host: '0.0.0.0',         // 允許外網監聽
     
